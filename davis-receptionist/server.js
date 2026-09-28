@@ -203,8 +203,11 @@ app.post('/collect', (req, res) => {
     s.data.details = heard;
     if (s.data.type === 'service request') {
       // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
+      // Script includes the required disclosures: frequency, rates, and opt-out.
       s.step = 'consent';
-      ask(r, "One last thing — can I text the booking link to the number you're calling from? Just say yes or no.", '/collect');
+      ask(r, "One last thing — can I text the booking link to the number you're calling from? " +
+        'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
+        'Just say yes or no.', '/collect');
       return res.type('text/xml').send(r.toString());
     }
     return finalize(req, res, s);
