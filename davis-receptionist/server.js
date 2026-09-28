@@ -119,10 +119,10 @@ async function finalize(req, res, s) {
     );
   }
 
-  // Text the caller the booking link for service requests
+  // Text the caller the booking link for service requests — only with explicit consent.
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
-  if (d.type === 'service request' && CONFIG.bookingUrl) {
+  if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
     await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${CONFIG.bookingUrl}`);
     goodbye += ' I also just texted you our online booking link.';
   }
@@ -201,6 +201,17 @@ app.post('/collect', (req, res) => {
   }
   if (s.step === 'details') {
     s.data.details = heard;
+    if (s.data.type === 'service request') {
+      // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
+      s.step = 'consent';
+      ask(r, "One last thing — can I text the booking link to the number you're calling from? Just say yes or no.", '/collect');
+      return res.type('text/xml').send(r.toString());
+    }
+    return finalize(req, res, s);
+  }
+  if (s.step === 'consent') {
+    const t = heard.toLowerCase();
+    s.data.smsConsent = /\b(yes|yeah|yep|yup|sure|okay|ok|please|go ahead|do it|sounds good|that works|correct|absolutely)\b/.test(t);
     return finalize(req, res, s);
   }
   // Unknown state — take a message.
