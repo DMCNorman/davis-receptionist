@@ -119,10 +119,10 @@ async function finalize(req, res, s) {
     );
   }
 
-  // Text the caller the booking link for service requests — only with explicit consent.
+  // Text the caller the booking link for service requests
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
-  if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
+  if (d.type === 'service request' && CONFIG.bookingUrl) {
     await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${CONFIG.bookingUrl}`);
     goodbye += ' I also just texted you our online booking link.';
   }
@@ -201,17 +201,6 @@ app.post('/collect', (req, res) => {
   }
   if (s.step === 'details') {
     s.data.details = heard;
-    if (s.data.type === 'service request') {
-      // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
-      s.step = 'consent';
-      ask(r, "One last thing — can I text the booking link to the number you're calling from? Just say yes or no.", '/collect');
-      return res.type('text/xml').send(r.toString());
-    }
-    return finalize(req, res, s);
-  }
-  if (s.step === 'consent') {
-    const t = heard.toLowerCase();
-    s.data.smsConsent = /\b(yes|yeah|yep|yup|sure|okay|ok|please|go ahead|do it|sounds good|that works|correct|absolutely)\b/.test(t);
     return finalize(req, res, s);
   }
   // Unknown state — take a message.
@@ -257,120 +246,6 @@ h1{font-size:22px} .meta{color:#666;margin-bottom:16px}</style></head>
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, twilio: hasTwilio }));
-
-/* ==================== Public compliance pages (A2P registration) ==================== */
-const PAGE_STYLE = `body{font-family:system-ui,-apple-system,sans-serif;margin:0;color:#222;line-height:1.6}
-.wrap{max-width:760px;margin:0 auto;padding:32px 20px}
-h1{font-size:26px;margin-bottom:4px}h2{font-size:18px;margin-top:28px}
-p,li{font-size:15px}.updated{color:#666;font-size:13px;margin-bottom:24px}
-footer{margin-top:40px;padding-top:16px;border-top:1px solid #ddd;font-size:13px;color:#666}`;
-
-app.get('/privacy-policy', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Privacy Policy — Davis Mechanical Contractors</title>
-<style>${PAGE_STYLE}</style></head><body><div class="wrap">
-<h1>Privacy Policy</h1>
-<div class="updated">Davis Mechanical Contractors · Effective September 28, 2026</div>
-
-<h2>Information we collect</h2>
-<p>When you call Davis Mechanical Contractors at <strong>713-875-0980</strong>, our automated
-receptionist may collect your name, phone number, service address, and a description of the
-HVAC issue you are calling about. We also retain call timestamps and call logs for service
-and compliance purposes.</p>
-
-<h2>How we use your information</h2>
-<ul>
-<li>To respond to your service request and arrange a callback or appointment.</li>
-<li>To send you a text message with our online booking link — <em>only</em> if you verbally
-agree to receive it during your call.</li>
-<li>To maintain records of service requests.</li>
-</ul>
-
-<h2>Text messages (SMS)</h2>
-<p>We send transactional text messages only — such as a booking link in direct response to a
-service call you placed with us. We do not send marketing or promotional texts. Message
-frequency varies by request and is typically one message per service call. Message and data
-rates may apply. Reply <strong>STOP</strong> to opt out of future texts, or
-<strong>HELP</strong> for help.</p>
-
-<h2>Sharing of information</h2>
-<p>We do not sell your personal information. <strong>Mobile opt-in data — including phone
-numbers collected for SMS — will not be shared with or sold to third parties</strong> for
-their marketing purposes. We share information only as needed to provide the service you
-requested (for example, with our phone service provider to deliver a text you asked for) or
-as required by law.</p>
-
-<h2>Data security and retention</h2>
-<p>We take reasonable measures to protect your information and retain call records only as
-long as needed for business and compliance purposes.</p>
-
-<h2>Contact us</h2>
-<p>Davis Mechanical Contractors<br>
-Brazoria County, Texas<br>
-Phone: <a href="tel:+17138750980">713-875-0980</a><br>
-Email: <a href="mailto:ndavis@davismechanicaltx.com">ndavis@davismechanicaltx.com</a></p>
-
-<p>We may update this policy from time to time; the current version will always be posted
-at this address.</p>
-<footer>© 2026 Davis Mechanical Contractors. All rights reserved.</footer>
-</div></body></html>`);
-});
-
-app.get('/terms', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SMS Terms of Service — Davis Mechanical Contractors</title>
-<style>${PAGE_STYLE}</style></head><body><div class="wrap">
-<h1>SMS Terms of Service</h1>
-<div class="updated">Davis Mechanical Contractors · Effective September 28, 2026</div>
-
-<h2>Program description</h2>
-<p>Davis Mechanical Contractors operates a customer-care text messaging program. When you call
-us at <strong>713-875-0980</strong> and request HVAC service through our automated
-receptionist, we may send you transactional text messages — such as a link to book your
-appointment online — in direct response to your call. This program is strictly for customer
-care; we do not send marketing or promotional messages.</p>
-
-<h2>Opting in</h2>
-<p>You opt in by calling us and verbally agreeing to receive a text message during your
-service call. A text is only sent when you clearly say yes. If you say no, stay silent, or
-give an unclear answer, no text is sent.</p>
-
-<h2>Message frequency</h2>
-<p>Message frequency varies based on your requests — typically one message per service call.</p>
-
-<h2>Cost</h2>
-<p><strong>Message and data rates may apply</strong> depending on your mobile plan.</p>
-
-<h2>Opting out</h2>
-<p>You can opt out at any time by replying <strong>STOP</strong> to any message. After you
-opt out, you will receive a confirmation text and no further messages will be sent unless
-you opt in again. For help, reply <strong>HELP</strong> or contact us at
-<a href="tel:+17138750980">713-875-0980</a>.</p>
-
-<h2>Supported carriers and delivery</h2>
-<p>Messages are sent through major U.S. wireless carriers. Delivery is subject to your
-carrier's coverage and is not guaranteed. Supported carriers may change without notice.</p>
-
-<h2>Privacy</h2>
-<p>Your mobile information is handled according to our
-<a href="/privacy-policy">Privacy Policy</a>. Mobile opt-in data will not be shared with
-third parties for their marketing purposes.</p>
-
-<h2>Contact us</h2>
-<p>Davis Mechanical Contractors<br>
-Brazoria County, Texas<br>
-Phone: <a href="tel:+17138750980">713-875-0980</a><br>
-Email: <a href="mailto:ndavis@davismechanicaltx.com">ndavis@davismechanicaltx.com</a></p>
-
-<h2>Changes to these terms</h2>
-<p>We may update these terms from time to time; the current version will always be posted
-at this address. Continued participation in the program after changes are posted
-constitutes acceptance of the updated terms.</p>
-<footer>© 2026 Davis Mechanical Contractors. All rights reserved.</footer>
-</div></body></html>`);
-});
 
 /* ==================== Start ==================== */
 const PORT = process.env.PORT || 3000;
