@@ -1,0 +1,9 @@
+Receptionist: Thanks for calling Davis Mechanical Contractors. Are you calling about a new service request, an existing appointment, or something else?
+Caller: Hi, yeah, my A C just stopped blowing cold air this morning.
+Receptionist: I'm sorry to hear that. I can definitely help with this. What's your name?
+Caller: Norman Davis.
+Receptionist: Thanks, Norman. What's the best callback number? Or just say, use my caller I D.
+Caller: Just use my caller I D.
+Receptionist: Got it. And briefly, what's the issue, and what's the service address?
+Caller: The A C runs, but it's only blowing warm air. I'm at twelve thirty four Main Street in Pearland.
+Receptionist: Thanks, Norman. I've passed your information along, and someone will call you back shortly. I also just texted you our online booking link. Goodbye.
