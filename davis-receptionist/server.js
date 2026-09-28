@@ -177,7 +177,8 @@ app.post('/collect', (req, res) => {
 
   if (!heard) {
     // Caller went silent mid-flow — wrap up with what we have.
-    s.data.details = s.data.details || '(caller went silent)';
+    s.data.details = s.data.details ||
+      (s.data.issue ? `Issue: ${s.data.issue} | Address: (not provided)` : '(caller went silent)');
     return finalize(req, res, s);
   }
 
@@ -195,12 +196,18 @@ app.post('/collect', (req, res) => {
   if (s.step === 'phone') {
     const digits = heard.replace(/\D/g, '');
     s.data.phone = /caller|my number|this number/i.test(heard) || digits.length < 7 ? req.body.From : heard;
-    s.step = 'details';
-    ask(r, 'And briefly, what\'s the issue and what\'s the service address?', '/collect');
+    s.step = 'issue';
+    ask(r, "Briefly, what's the issue with your system?", '/collect');
     return res.type('text/xml').send(r.toString());
   }
-  if (s.step === 'details') {
-    s.data.details = heard;
+  if (s.step === 'issue') {
+    s.data.issue = heard;
+    s.step = 'address';
+    ask(r, "And what's the service address?", '/collect');
+    return res.type('text/xml').send(r.toString());
+  }
+  if (s.step === 'address') {
+    s.data.details = `Issue: ${s.data.issue} | Address: ${heard}`;
     if (s.data.type === 'service request') {
       // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
       // Script includes the required disclosures: frequency, rates, and opt-out.
