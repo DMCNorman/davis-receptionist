@@ -24,7 +24,8 @@ const CONFIG = {
   bookingUrl: process.env.BOOKING_URL || '',   // Housecall Pro booking link
   voice: 'Polly.Kimberly',                     // Twilio neural voice
   language: 'en-US',
-  hours: { start: 8, end: 17 },                // server-local time; greeting only
+  hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
+  timeZone: process.env.TIME_ZONE || 'America/Chicago',
 };
 
 const twilioNumber = process.env.TWILIO_PHONE_NUMBER || '';
@@ -69,7 +70,10 @@ function getSession(callSid) {
 /* ==================== Helpers ==================== */
 const newCall = () => new twilio.twiml.VoiceResponse();
 const inHours = () => {
-  const h = new Date().getHours();
+  // Business hours are evaluated in the business's timezone, not the server's (Render runs on UTC).
+  const h = Number(new Intl.DateTimeFormat('en-US', {
+    timeZone: CONFIG.timeZone, hour: 'numeric', hour12: false,
+  }).format(new Date()));
   return h >= CONFIG.hours.start && h < CONFIG.hours.end;
 };
 const esc = (s) =>
