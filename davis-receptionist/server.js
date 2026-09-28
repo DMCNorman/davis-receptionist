@@ -22,7 +22,7 @@ const CONFIG = {
   businessName: process.env.BUSINESS_NAME || 'Davis Mechanical Contractors',
   ownerPhones: (process.env.OWNER_PHONE || '').split(',').map((s) => s.trim()).filter(Boolean),
   bookingUrl: process.env.BOOKING_URL || '',   // Housecall Pro booking link
-  voice: 'Polly.Kendra',                     // Twilio neural voice
+  voice: 'Polly.Ruth',                     // Twilio neural voice
   language: 'en-US',
   hours: { start: 8, end: 17 },                // server-local time; greeting only
 };
