@@ -214,10 +214,12 @@ app.post('/collect', (req, res) => {
     s.data.details = `Issue: ${s.data.issue} | Address: ${heard}`;
     if (s.data.type === 'service request') {
       // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
-      // Script includes the required disclosures: frequency, rates, and opt-out.
+      // Script includes the required disclosures: frequency, rates, opt-out, and
+      // agreement to SMS terms and privacy policy.
       s.step = 'consent';
       ask(r, "One last thing — can I text the booking link to the number you're calling from? " +
         'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
+        'By saying yes, you agree to our SMS terms and privacy policy, which are posted on our website. ' +
         'Just say yes or no.', '/collect');
       return res.type('text/xml').send(r.toString());
     }
@@ -309,11 +311,11 @@ rates may apply. Reply <strong>STOP</strong> to opt out of future texts, or
 <strong>HELP</strong> for help.</p>
 
 <h2>Sharing of information</h2>
-<p>We do not sell your personal information. <strong>Mobile opt-in data — including phone
-numbers collected for SMS — will not be shared with or sold to third parties</strong> for
-their marketing purposes. We share information only as needed to provide the service you
-requested (for example, with our phone service provider to deliver a text you asked for) or
-as required by law.</p>
+<p>We do not sell your personal information. <strong>Mobile information and messaging consent —
+including phone numbers collected for SMS — are not shared with third parties or affiliates
+for marketing or promotional purposes.</strong> We share information only as needed to provide
+the service you requested (for example, with our phone service provider to deliver a text
+you asked for) or as required by law.</p>
 
 <h2>Data security and retention</h2>
 <p>We take reasonable measures to protect your information and retain call records only as
@@ -369,8 +371,8 @@ carrier's coverage and is not guaranteed. Supported carriers may change without 
 
 <h2>Privacy</h2>
 <p>Your mobile information is handled according to our
-<a href="/privacy-policy">Privacy Policy</a>. Mobile opt-in data will not be shared with
-third parties for their marketing purposes.</p>
+<a href="/privacy-policy">Privacy Policy</a>. Mobile information and messaging consent are
+not shared with third parties or affiliates for marketing or promotional purposes.</p>
 
 <h2>Contact us</h2>
 <p>Davis Mechanical Contractors<br>
