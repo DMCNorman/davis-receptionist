@@ -22,7 +22,7 @@ const CONFIG = {
   businessName: process.env.BUSINESS_NAME || 'Davis Mechanical Contractors',
   ownerPhones: (process.env.OWNER_PHONE || '').split(',').map((s) => s.trim()).filter(Boolean),
   bookingUrl: process.env.BOOKING_URL || '',   // Housecall Pro booking link
-  voice: 'Polly.Kimberly',                     // Twilio neural voice
+  voice: 'Polly.Salli-Neural',                // Twilio Polly neural voice (on Twilio's supported list)
   language: 'en-US',
   hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
   timeZone: process.env.TIME_ZONE || 'America/Chicago',
@@ -81,7 +81,7 @@ const esc = (s) =>
 
 /** Ask a spoken question and listen for speech. Silence -> take a message. */
 function ask(res, question, action) {
-  const gather = res.gather({ input: 'speech', action, speechTimeout: 4, language: CONFIG.language });
+  const gather = res.gather({ input: 'speech', action, speechTimeout: 3, language: CONFIG.language });
   gather.say({ voice: CONFIG.voice }, question);
   res.redirect('/take-message');
 }
@@ -211,19 +211,34 @@ app.post('/collect', (req, res) => {
     return res.type('text/xml').send(r.toString());
   }
   if (s.step === 'address') {
+    s.data.address = heard;
     s.data.details = `Issue: ${s.data.issue} | Address: ${heard}`;
     if (s.data.type === 'service request') {
-      // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
-      // Script includes the required disclosures: frequency, rates, opt-out, and
-      // agreement to SMS terms and privacy policy.
-      s.step = 'consent';
-      ask(r, "One last thing — can I text the booking link to the number you're calling from? " +
-        'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
-        'By saying yes, you agree to our SMS terms and privacy policy, which are posted on our website. ' +
-        'Just say yes or no.', '/collect');
+      // Preferred appointment day + window before the SMS consent question.
+      s.step = 'date';
+      ask(r, "What day works best for your appointment? We're open weekdays from 8 to 5.", '/collect');
       return res.type('text/xml').send(r.toString());
     }
     return finalize(req, res, s);
+  }
+  if (s.step === 'date') {
+    s.data.prefDate = heard;
+    s.step = 'window';
+    ask(r, 'And do you prefer a morning or an afternoon window?', '/collect');
+    return res.type('text/xml').send(r.toString());
+  }
+  if (s.step === 'window') {
+    s.data.prefWindow = heard;
+    s.data.details += ` | Preferred: ${s.data.prefDate}, ${heard}`;
+    // Explicit SMS consent (A2P compliance): only text the booking link on a clear yes.
+    // Script includes the required disclosures: frequency, rates, opt-out, and
+    // agreement to SMS terms and privacy policy.
+    s.step = 'consent';
+    ask(r, "One last thing — can I text the booking link to the number you're calling from? " +
+      'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
+      'By saying yes, you agree to our SMS terms and privacy policy, which are posted on our website. ' +
+      'Just say yes or no.', '/collect');
+    return res.type('text/xml').send(r.toString());
   }
   if (s.step === 'consent') {
     const t = heard.toLowerCase();
