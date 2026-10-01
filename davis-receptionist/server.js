@@ -81,7 +81,7 @@ const esc = (s) =>
 
 /** Ask a spoken question and listen for speech. Silence -> take a message. */
 function ask(res, question, action) {
-  const gather = res.gather({ input: 'speech', action, speechTimeout: 3, language: CONFIG.language });
+  const gather = res.gather({ input: 'speech', action, speechTimeout: 2, language: CONFIG.language });
   gather.say({ voice: CONFIG.voice }, question);
   res.redirect('/take-message');
 }
