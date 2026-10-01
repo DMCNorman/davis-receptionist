@@ -259,11 +259,22 @@ app.post('/take-message', (req, res) => {
 });
 
 /* ==================== SMS auto-reply ==================== */
+const digits = (s) => String(s || '').replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
 app.post('/sms', async (req, res) => {
   const r = new twilio.twiml.MessagingResponse();
+  const from = req.body.From || 'unknown';
+  const text = req.body.Body || '-';
   const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${CONFIG.bookingUrl || '(booking link coming soon)'} — or just reply and we'll call you back.`;
   r.message(body);
-  writeLog({ from: req.body.From || 'unknown', type: 'sms inbound', name: '-', phone: req.body.From || '-', details: req.body.Body || '-' });
+  writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
+  // Alert the owner(s) so text replies don't sit unseen on the dashboard.
+  // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
+  const ownerDigits = CONFIG.ownerPhones.map(digits);
+  if (!ownerDigits.includes(digits(from))) {
+    for (const num of CONFIG.ownerPhones) {
+      await sendSms(num, `Text reply from ${from}: ${text}`);
+    }
+  }
   res.type('text/xml').send(r.toString());
 });
 
