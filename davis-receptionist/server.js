@@ -5,7 +5,10 @@
  *  - Answers incoming calls with a spoken greeting (after-hours aware)
  *  - Routes callers: new service request / existing appointment / emergency / message
  *  - Collects name, callback number, and issue description via speech
- *  - Texts the caller your Housecall Pro booking link
+ *  - Texts the caller your Housecall Pro booking link as a unique tracked URL
+ *    (/b/:token) — taps are logged and shown in the dashboard's "Link tap" column,
+ *    then redirect to the real booking page. Self-hosted: no Twilio add-ons or DNS
+ *    changes needed.
  *  - Texts YOU (owner) a lead alert with the details
  *  - Logs every call to data/calls.json + a simple dashboard at /
  *
@@ -14,6 +17,7 @@
 require('dotenv').config();
 const express = require('express');
 const twilio = require('twilio');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -22,6 +26,8 @@ const CONFIG = {
   businessName: process.env.BUSINESS_NAME || 'Davis Mechanical Contractors',
   ownerPhones: (process.env.OWNER_PHONE || '').split(',').map((s) => s.trim()).filter(Boolean),
   bookingUrl: process.env.BOOKING_URL || '',   // Housecall Pro booking link
+  // Public base URL used for self-hosted tracked booking links (/b/:token).
+  publicBaseUrl: (process.env.PUBLIC_BASE_URL || 'https://davis-receptionist.onrender.com').replace(/\/$/, ''),
   voice: 'Polly.Salli-Neural',                // Twilio Polly neural voice (on Twilio's supported list)
   language: 'en-US',
   hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
@@ -108,8 +114,79 @@ async function sendSms(to, body) {
   }
 }
 
+/* ==================== Self-hosted tracked booking links ==================== */
+// Each booking-link text gets a unique /b/:token URL. Tapping it logs the tap
+// (dashboard "Link tap" column) and 302-redirects to the real booking URL.
+// No Twilio add-ons, no DNS changes — everything runs on this server.
+const LINK_FILE = path.join(__dirname, 'data', 'links.json');
+function readLinks() {
+  try {
+    return JSON.parse(fs.readFileSync(LINK_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+function writeLinks(links) {
+  try {
+    fs.mkdirSync(path.dirname(LINK_FILE), { recursive: true });
+    const keys = Object.keys(links).slice(-2000); // cap stored links
+    const trimmed = {};
+    for (const k of keys) trimmed[k] = links[k];
+    fs.writeFileSync(LINK_FILE, JSON.stringify(trimmed));
+  } catch (e) {
+    console.error('link store write failed:', e.message);
+  }
+}
+function makeTrackedLink(to, url) {
+  const token = crypto.randomBytes(9).toString('hex');
+  const links = readLinks();
+  links[token] = { url, to, createdAt: new Date().toISOString(), hits: 0 };
+  writeLinks(links);
+  return `${CONFIG.publicBaseUrl}/b/${token}`;
+}
+// User-agents that fetch link previews/thumbnails without a human tapping.
+// Imperfect by nature (some phone previews look like normal browsers), but it
+// filters the obvious bots so the "Link tap" column stays honest.
+const PREVIEW_UA = /facebookexternalhit|twitterbot|linkedinbot|slackbot|whatsapp|telegrambot|discordbot|googlebot|bingbot|preview|prerender|headless|phantomjs/i;
+
+/** Mark the most recent call-log entry for a phone number as link-clicked. */
+function recordLinkClick(toNumber, clickTime) {
+  try {
+    const want = digits(toNumber);
+    const log = readLog();
+    const entry = log.find(
+      (c) => !c.linkClickedAt && (digits(c.phone) === want || digits(c.from) === want)
+    );
+    if (entry) {
+      entry.linkClickedAt = clickTime || new Date().toISOString();
+      entry.linkClickCount = (entry.linkClickCount || 0) + 1;
+      fs.writeFileSync(DATA_FILE, JSON.stringify(log.slice(0, 500), null, 2));
+      return true;
+    }
+  } catch (e) {
+    console.error('link click log failed:', e.message);
+  }
+  return false;
+}
+
 /** Log the call, notify owner + caller, say goodbye. */
 async function finalize(req, res, s) {
+  try {
+    return await finalizeInner(req, res, s);
+  } catch (e) {
+    console.error('finalize error:', e.message);
+    sessions.delete(req.body.CallSid);
+    const r = newCall();
+    r.say(
+      { voice: CONFIG.voice },
+      "Sorry, something went wrong on our end. We've logged your call and someone will call you back shortly."
+    );
+    r.hangup();
+    return res.type('text/xml').send(r.toString());
+  }
+}
+
+async function finalizeInner(req, res, s) {
   const d = s.data;
   const caller = req.body.From || 'unknown';
 
@@ -127,7 +204,8 @@ async function finalize(req, res, s) {
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
   if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
-    await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${CONFIG.bookingUrl}`);
+    const link = makeTrackedLink(caller, CONFIG.bookingUrl);
+    await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`);
     goodbye += ' I also just texted you our online booking link.';
   }
   r.say({ voice: CONFIG.voice }, goodbye + ' Goodbye.');
@@ -264,7 +342,8 @@ app.post('/sms', async (req, res) => {
   const r = new twilio.twiml.MessagingResponse();
   const from = req.body.From || 'unknown';
   const text = req.body.Body || '-';
-  const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${CONFIG.bookingUrl || '(booking link coming soon)'} — or just reply and we'll call you back.`;
+  const link = CONFIG.bookingUrl ? makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
+  const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
   r.message(body);
   writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
@@ -278,14 +357,53 @@ app.post('/sms', async (req, res) => {
   res.type('text/xml').send(r.toString());
 });
 
+/* ==================== Tracked link redirect (/b/:token) ==================== */
+app.get('/b/:token', (req, res) => {
+  const links = readLinks();
+  const rec = links[req.params.token];
+  if (!rec || !rec.url) return res.status(404).send('This link is no longer available.');
+  const ua = req.get('user-agent') || '';
+  rec.hits = (rec.hits || 0) + 1;
+  rec.lastHitAt = new Date().toISOString();
+  if (!PREVIEW_UA.test(ua) && !rec.tappedAt) {
+    rec.tappedAt = rec.lastHitAt;
+    const matched = recordLinkClick(rec.to, rec.lastHitAt);
+    console.log(`link tap: ${rec.to} at ${rec.lastHitAt} (matched call log: ${matched})`);
+  }
+  writeLinks(links);
+  res.redirect(302, rec.url);
+});
+
+/* ==================== Error handling ==================== */
+// If anything throws, never hand Twilio an HTML error page (it plays
+// "an application error has occurred" and hangs up). Answer with valid
+// TwiML so the caller hears a graceful goodbye instead.
+app.use((err, req, res, next) => {
+  console.error('webhook error:', err && err.message);
+  try {
+    const r = newCall();
+    r.say(
+      { voice: CONFIG.voice },
+      "Sorry, something went wrong on our end. Please call back in a moment, or send us a text and we'll get right back to you."
+    );
+    r.hangup();
+    res.type('text/xml').send(r.toString());
+  } catch {
+    res.type('text/xml').send('<Response><Hangup/></Response>');
+  }
+});
+
 /* ==================== Dashboard ==================== */
 app.get('/', (req, res) => {
   const log = readLog();
   const rows = log
-    .map(
-      (c) => `<tr><td>${esc(new Date(c.at).toLocaleString())}</td><td>${esc(c.type)}</td>` +
-        `<td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td>${esc(c.details)}</td></tr>`
-    )
+    .map((c) => {
+      const link = c.linkClickedAt
+        ? `✅ ${esc(new Date(c.linkClickedAt).toLocaleString())}${c.linkClickCount > 1 ? ` (${c.linkClickCount}×)` : ''}`
+        : '–';
+      return `<tr><td>${esc(new Date(c.at).toLocaleString())}</td><td>${esc(c.type)}</td>` +
+        `<td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td>${esc(c.details)}</td><td>${link}</td></tr>`;
+    })
     .join('');
   res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(CONFIG.businessName)} — Call log</title>
@@ -294,11 +412,11 @@ th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:14px}th{backgr
 h1{font-size:22px} .meta{color:#666;margin-bottom:16px}</style></head>
 <body><h1>${esc(CONFIG.businessName)} — Receptionist call log</h1>
 <div class="meta">${log.length} calls logged · <a href="/">refresh</a></div>
-<table><tr><th>Time</th><th>Type</th><th>Name</th><th>Phone</th><th>Details</th></tr>${rows || '<tr><td colspan=5>No calls yet.</td></tr>'}</table>
+<table><tr><th>Time</th><th>Type</th><th>Name</th><th>Phone</th><th>Details</th><th>Link tap</th></tr>${rows || '<tr><td colspan=6>No calls yet.</td></tr>'}</table>
 </body></html>`);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, twilio: hasTwilio }));
+app.get('/health', (req, res) => res.json({ ok: true, twilio: hasTwilio, linkTracking: 'self-hosted' }));
 
 /* ==================== Public compliance pages (A2P registration) ==================== */
 const PAGE_STYLE = `body{font-family:system-ui,-apple-system,sans-serif;margin:0;color:#222;line-height:1.6}
