@@ -41,19 +41,122 @@ const client = hasTwilio ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TW
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-/* ==================== Call log (JSON file) ==================== */
+/* ==================== Call log + tracked links (Postgres when DATABASE_URL
+     is set — survives deploys/restarts; JSON file fallback otherwise) ==================== */
 const DATA_FILE = path.join(__dirname, 'data', 'calls.json');
-function readLog() {
+const LINK_FILE = path.join(__dirname, 'data', 'links.json');
+let pgPool = null;
+
+async function initDb() {
+  if (!process.env.DATABASE_URL) {
+    console.log('storage: no DATABASE_URL — using local JSON files');
+    return;
+  }
+  try {
+    const { Pool } = require('pg');
+    pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    });
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS calls (
+      id SERIAL PRIMARY KEY,
+      at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      type TEXT, name TEXT, phone TEXT, from_number TEXT, details TEXT,
+      link_clicked_at TIMESTAMPTZ, link_click_count INT DEFAULT 0
+    )`);
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS booking_links (
+      token TEXT PRIMARY KEY,
+      url TEXT NOT NULL, to_number TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      hits INT DEFAULT 0, last_hit_at TIMESTAMPTZ, tapped_at TIMESTAMPTZ
+    )`);
+    console.log('storage: Postgres connected (durable log)');
+    await migrateLocalFilesOnce();
+  } catch (e) {
+    console.error('storage: Postgres init failed, falling back to local files:', e.message);
+    pgPool = null;
+  }
+}
+
+/** One-time import of any pre-existing local JSON log/links into Postgres. */
+async function migrateLocalFilesOnce() {
+  if (!pgPool) return;
+  try {
+    const calls = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (Array.isArray(calls) && calls.length) {
+      for (const c of calls) {
+        await pgPool.query(
+          `INSERT INTO calls (at, type, name, phone, from_number, details, link_clicked_at, link_click_count)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [c.at || new Date().toISOString(), c.type, c.name, c.phone, c.from, c.details,
+           c.linkClickedAt || null, c.linkClickCount || 0]
+        );
+      }
+      console.log(`storage: migrated ${calls.length} local log entries`);
+    }
+    const links = JSON.parse(fs.readFileSync(LINK_FILE, 'utf8'));
+    const keys = links && typeof links === 'object' ? Object.keys(links) : [];
+    for (const token of keys) {
+      const l = links[token];
+      if (!l || !l.url) continue;
+      await pgPool.query(
+        `INSERT INTO booking_links (token, url, to_number, created_at, hits, last_hit_at, tapped_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (token) DO NOTHING`,
+        [token, l.url, l.to, l.createdAt || new Date().toISOString(), l.hits || 0, l.lastHitAt || null, l.tappedAt || null]
+      );
+    }
+    if (keys.length) console.log(`storage: migrated ${keys.length} tracked links`);
+    // Archive the local files so they can't be re-imported.
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    for (const f of [DATA_FILE, LINK_FILE]) {
+      try { fs.renameSync(f, `${f}.${stamp}.migrated`); } catch {}
+    }
+  } catch (e) {
+    // No local files or empty — nothing to migrate.
+  }
+}
+
+function readLogLocal() {
   try {
     return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch {
     return [];
   }
 }
-function writeLog(entry) {
+async function readLog() {
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT id, at, type, name, phone, from_number, details, link_clicked_at, link_click_count
+         FROM calls ORDER BY at DESC LIMIT 500`
+      );
+      return rows.map((r) => ({
+        at: r.at.toISOString(), type: r.type, name: r.name, phone: r.phone, from: r.from_number,
+        details: r.details, linkClickedAt: r.link_clicked_at ? r.link_clicked_at.toISOString() : null,
+        linkClickCount: r.link_click_count,
+      }));
+    } catch (e) {
+      console.error('log read failed:', e.message);
+      return readLogLocal();
+    }
+  }
+  return readLogLocal();
+}
+async function writeLog(entry) {
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO calls (at, type, name, phone, from_number, details) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [new Date().toISOString(), entry.type, entry.name, entry.phone, entry.from, entry.details]
+      );
+      return;
+    } catch (e) {
+      console.error('log write failed:', e.message);
+    }
+  }
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    const log = readLog();
+    const log = readLogLocal();
     log.unshift({ at: new Date().toISOString(), ...entry });
     fs.writeFileSync(DATA_FILE, JSON.stringify(log.slice(0, 500), null, 2));
   } catch (e) {
@@ -118,30 +221,61 @@ async function sendSms(to, body) {
 // Each booking-link text gets a unique /b/:token URL. Tapping it logs the tap
 // (dashboard "Link tap" column) and 302-redirects to the real booking URL.
 // No Twilio add-ons, no DNS changes — everything runs on this server.
-const LINK_FILE = path.join(__dirname, 'data', 'links.json');
-function readLinks() {
+
+async function getLink(token) {
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query('SELECT * FROM booking_links WHERE token = $1', [token]);
+      const r = rows[0];
+      if (!r) return null;
+      return { url: r.url, to: r.to_number, createdAt: r.created_at.toISOString(), hits: r.hits,
+               lastHitAt: r.last_hit_at ? r.last_hit_at.toISOString() : null, tappedAt: r.tapped_at ? r.tapped_at.toISOString() : null };
+    } catch (e) {
+      console.error('link read failed:', e.message);
+    }
+  }
+  return readLinksLocal()[token] || null;
+}
+function readLinksLocal() {
   try {
     return JSON.parse(fs.readFileSync(LINK_FILE, 'utf8'));
   } catch {
     return {};
   }
 }
-function writeLinks(links) {
+async function saveLink(token, rec) {
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO booking_links (token, url, to_number, created_at, hits, last_hit_at, tapped_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (token) DO UPDATE SET url=EXCLUDED.url, to_number=EXCLUDED.to_number,
+           hits=EXCLUDED.hits, last_hit_at=EXCLUDED.last_hit_at, tapped_at=EXCLUDED.tapped_at`,
+        [token, rec.url, rec.to, rec.createdAt || new Date().toISOString(), rec.hits || 0,
+         rec.lastHitAt || null, rec.tappedAt || null]
+      );
+      return;
+    } catch (e) {
+      console.error('link save failed:', e.message);
+    }
+  }
   try {
     fs.mkdirSync(path.dirname(LINK_FILE), { recursive: true });
-    const keys = Object.keys(links).slice(-2000); // cap stored links
+    const links = readLinksLocal();
+    links[token] = rec;
+    const keys = Object.keys(links).slice(-2000);
     const trimmed = {};
     for (const k of keys) trimmed[k] = links[k];
     fs.writeFileSync(LINK_FILE, JSON.stringify(trimmed));
   } catch (e) {
-    console.error('link store write failed:', e.message);
+    console.error('link save failed:', e.message);
   }
 }
-function makeTrackedLink(to, url) {
+const readLinks = readLinksLocal; // local snapshot helper (sync contexts)
+async function makeTrackedLink(to, url) {
   const token = crypto.randomBytes(9).toString('hex');
-  const links = readLinks();
-  links[token] = { url, to, createdAt: new Date().toISOString(), hits: 0 };
-  writeLinks(links);
+  const rec = { url, to, createdAt: new Date().toISOString(), hits: 0 };
+  await saveLink(token, rec);
   return `${CONFIG.publicBaseUrl}/b/${token}`;
 }
 // User-agents that fetch link previews/thumbnails without a human tapping.
@@ -150,15 +284,32 @@ function makeTrackedLink(to, url) {
 const PREVIEW_UA = /facebookexternalhit|twitterbot|linkedinbot|slackbot|whatsapp|telegrambot|discordbot|googlebot|bingbot|preview|prerender|headless|phantomjs/i;
 
 /** Mark the most recent call-log entry for a phone number as link-clicked. */
-function recordLinkClick(toNumber, clickTime) {
+async function recordLinkClick(toNumber, clickTime) {
+  const want = digits(toNumber);
+  const at = clickTime || new Date().toISOString();
+  if (pgPool) {
+    try {
+      const { rowCount } = await pgPool.query(
+        `UPDATE calls SET link_clicked_at = $1, link_click_count = link_click_count + 1
+         WHERE id = (SELECT id FROM calls
+                     WHERE link_clicked_at IS NULL
+                       AND (regexp_replace(COALESCE(phone,''), '\\D', '', 'g') = $2
+                            OR regexp_replace(COALESCE(from_number,''), '\\D', '', 'g') = $2)
+                     ORDER BY at DESC LIMIT 1)`,
+        [at, want]
+      );
+      return rowCount > 0;
+    } catch (e) {
+      console.error('link click log failed:', e.message);
+    }
+  }
   try {
-    const want = digits(toNumber);
-    const log = readLog();
+    const log = readLogLocal();
     const entry = log.find(
       (c) => !c.linkClickedAt && (digits(c.phone) === want || digits(c.from) === want)
     );
     if (entry) {
-      entry.linkClickedAt = clickTime || new Date().toISOString();
+      entry.linkClickedAt = at;
       entry.linkClickCount = (entry.linkClickCount || 0) + 1;
       fs.writeFileSync(DATA_FILE, JSON.stringify(log.slice(0, 500), null, 2));
       return true;
@@ -190,7 +341,7 @@ async function finalizeInner(req, res, s) {
   const d = s.data;
   const caller = req.body.From || 'unknown';
 
-  writeLog({ from: caller, type: d.type, name: d.name || '-', phone: d.phone || caller, details: d.details || '-' });
+  await writeLog({ from: caller, type: d.type, name: d.name || '-', phone: d.phone || caller, details: d.details || '-' });
 
   // Alert the owner(s) — supports multiple comma-separated numbers
   for (const num of CONFIG.ownerPhones) {
@@ -204,7 +355,7 @@ async function finalizeInner(req, res, s) {
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
   if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
-    const link = makeTrackedLink(caller, CONFIG.bookingUrl);
+    const link = await makeTrackedLink(caller, CONFIG.bookingUrl);
     await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`);
     goodbye += ' I also just texted you our online booking link.';
   }
@@ -342,10 +493,10 @@ app.post('/sms', async (req, res) => {
   const r = new twilio.twiml.MessagingResponse();
   const from = req.body.From || 'unknown';
   const text = req.body.Body || '-';
-  const link = CONFIG.bookingUrl ? makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
+  const link = CONFIG.bookingUrl ? await makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
   const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
   r.message(body);
-  writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
+  await writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
   // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
   const ownerDigits = CONFIG.ownerPhones.map(digits);
@@ -358,19 +509,18 @@ app.post('/sms', async (req, res) => {
 });
 
 /* ==================== Tracked link redirect (/b/:token) ==================== */
-app.get('/b/:token', (req, res) => {
-  const links = readLinks();
-  const rec = links[req.params.token];
+app.get('/b/:token', async (req, res) => {
+  const rec = await getLink(req.params.token);
   if (!rec || !rec.url) return res.status(404).send('This link is no longer available.');
   const ua = req.get('user-agent') || '';
   rec.hits = (rec.hits || 0) + 1;
   rec.lastHitAt = new Date().toISOString();
   if (!PREVIEW_UA.test(ua) && !rec.tappedAt) {
     rec.tappedAt = rec.lastHitAt;
-    const matched = recordLinkClick(rec.to, rec.lastHitAt);
+    const matched = await recordLinkClick(rec.to, rec.lastHitAt);
     console.log(`link tap: ${rec.to} at ${rec.lastHitAt} (matched call log: ${matched})`);
   }
-  writeLinks(links);
+  await saveLink(req.params.token, rec);
   res.redirect(302, rec.url);
 });
 
@@ -394,8 +544,8 @@ app.use((err, req, res, next) => {
 });
 
 /* ==================== Dashboard ==================== */
-app.get('/', (req, res) => {
-  const log = readLog();
+app.get('/', async (req, res) => {
+  const log = await readLog();
   const rows = log
     .map((c) => {
       const link = c.linkClickedAt
@@ -534,6 +684,8 @@ constitutes acceptance of the updated terms.</p>
 
 /* ==================== Start ==================== */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Receptionist listening on :${PORT} (Twilio creds ${hasTwilio ? 'loaded' : 'MISSING — copy .env.example to .env'})`);
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Receptionist listening on :${PORT} (Twilio creds ${hasTwilio ? 'loaded' : 'MISSING — copy .env.example to .env'})`);
+  });
 });
