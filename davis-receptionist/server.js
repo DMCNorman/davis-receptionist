@@ -398,7 +398,10 @@ app.post('/route', (req, res) => {
     s.step = 'one-shot';
     ask(r, 'Got it. Please say your name and tell me briefly what\'s going on with your appointment.', '/collect');
   } else {
-    return res.redirect(307, '/take-message');
+    // "Something else" — ask what they need before taking a message.
+    s.data.type = 'general inquiry';
+    s.step = 'se-help';
+    ask(r, "Of course — what can I help you with?", '/collect');
   }
   res.type('text/xml').send(r.toString());
 });
@@ -418,6 +421,24 @@ app.post('/collect', (req, res) => {
   if (s.step === 'one-shot') {
     s.data.name = '-';
     s.data.details = heard;
+    return finalize(req, res, s);
+  }
+  // "Something else" flow: what they need -> name -> callback number -> done.
+  if (s.step === 'se-help') {
+    s.data.details = heard;
+    s.step = 'se-name';
+    ask(r, "Got it. What's your name?", '/collect');
+    return res.type('text/xml').send(r.toString());
+  }
+  if (s.step === 'se-name') {
+    s.data.name = heard;
+    s.step = 'se-phone';
+    ask(r, `Thanks ${heard}. What's the best callback number? Or just say "use my caller ID".`, '/collect');
+    return res.type('text/xml').send(r.toString());
+  }
+  if (s.step === 'se-phone') {
+    const digits = heard.replace(/\D/g, '');
+    s.data.phone = /caller|my number|this number/i.test(heard) || digits.length < 7 ? req.body.From : heard;
     return finalize(req, res, s);
   }
   if (s.step === 'name') {
