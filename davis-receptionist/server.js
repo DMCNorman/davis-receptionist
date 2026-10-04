@@ -30,7 +30,7 @@ const CONFIG = {
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || 'https://davis-receptionist.onrender.com').replace(/\/$/, ''),
   voice: 'Polly.Salli-Neural',                // Twilio Polly neural voice (on Twilio's supported list)
   language: 'en-US',
-  hours: { start: 8, end: 17 },                // business hours (Mon-Fri) in CONFIG.timeZone; greeting only
+  hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
   timeZone: process.env.TIME_ZONE || 'America/Chicago',
 };
 
@@ -180,14 +180,10 @@ function getSession(callSid) {
 const newCall = () => new twilio.twiml.VoiceResponse();
 const inHours = () => {
   // Business hours are evaluated in the business's timezone, not the server's (Render runs on UTC).
-  // Monday–Friday, 8 AM–5 PM. Everything else (evenings, weekends) counts as after hours.
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: CONFIG.timeZone, hour: 'numeric', hour12: false, weekday: 'short',
-  }).formatToParts(new Date());
-  const h = Number(parts.find((p) => p.type === 'hour').value);
-  const dow = parts.find((p) => p.type === 'weekday').value;
-  const isWeekday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(dow);
-  return isWeekday && h >= CONFIG.hours.start && h < CONFIG.hours.end;
+  const h = Number(new Intl.DateTimeFormat('en-US', {
+    timeZone: CONFIG.timeZone, hour: 'numeric', hour12: false,
+  }).format(new Date()));
+  return h >= CONFIG.hours.start && h < CONFIG.hours.end;
 };
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -344,6 +340,7 @@ async function finalize(req, res, s) {
 async function finalizeInner(req, res, s) {
   const d = s.data;
   const caller = req.body.From || 'unknown';
+  s.finalized = true; // Prevent double-alert from /call-status
 
   await writeLog({ from: caller, type: d.type, name: d.name || '-', phone: d.phone || caller, details: d.details || '-' });
 
@@ -355,13 +352,13 @@ async function finalizeInner(req, res, s) {
     );
   }
 
-  // Text the caller the scheduling link — only with explicit consent (A2P compliance).
+  // Text the caller the booking link for service requests — only with explicit consent.
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
-  if ((d.type === 'service request' || d.type === 'general inquiry') && CONFIG.bookingUrl && d.smsConsent) {
+  if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
     const link = await makeTrackedLink(caller, CONFIG.bookingUrl);
     await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`);
-    goodbye += ' I also just texted you our online scheduling link.';
+    goodbye += ' I also just texted you our online booking link.';
   }
   r.say({ voice: CONFIG.voice }, goodbye + ' Goodbye.');
   r.hangup();
@@ -402,10 +399,7 @@ app.post('/route', (req, res) => {
     s.step = 'one-shot';
     ask(r, 'Got it. Please say your name and tell me briefly what\'s going on with your appointment.', '/collect');
   } else {
-    // "Something else" — ask what they need before taking a message.
-    s.data.type = 'general inquiry';
-    s.step = 'se-help';
-    ask(r, "Of course — what can I help you with?", '/collect');
+    return res.redirect(307, '/take-message');
   }
   res.type('text/xml').send(r.toString());
 });
@@ -421,39 +415,11 @@ app.post('/collect', (req, res) => {
       (s.data.issue ? `Issue: ${s.data.issue} | Address: (not provided)` : '(caller went silent)');
     return finalize(req, res, s);
   }
+  s.silentLoops = 0; // They spoke — reset the silence counter.
 
   if (s.step === 'one-shot') {
     s.data.name = '-';
     s.data.details = heard;
-    return finalize(req, res, s);
-  }
-  // "Something else" flow: what they need -> name -> callback number -> done.
-  if (s.step === 'se-help') {
-    s.data.details = heard;
-    s.step = 'se-name';
-    ask(r, "Got it. What's your name?", '/collect');
-    return res.type('text/xml').send(r.toString());
-  }
-  if (s.step === 'se-name') {
-    s.data.name = heard;
-    s.step = 'se-phone';
-    ask(r, `Thanks ${heard}. What's the best callback number? Or just say "use my caller ID".`, '/collect');
-    return res.type('text/xml').send(r.toString());
-  }
-  if (s.step === 'se-phone') {
-    const digits = heard.replace(/\D/g, '');
-    s.data.phone = /caller|my number|this number/i.test(heard) || digits.length < 7 ? req.body.From : heard;
-    // Ask SMS consent before texting the scheduling link (A2P compliance).
-    s.step = 'se-consent';
-    ask(r, "One last thing — can I text you our online scheduling link? " +
-      'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
-      'By saying yes, you agree to our SMS terms and privacy policy, which are posted on our website. ' +
-      'Just say yes or no.', '/collect');
-    return res.type('text/xml').send(r.toString());
-  }
-  if (s.step === 'se-consent') {
-    const t = heard.toLowerCase();
-    s.data.smsConsent = /\b(yes|yeah|yep|yup|sure|okay|ok|please|go ahead|do it|sounds good|that works|correct|absolutely)\b/.test(t);
     return finalize(req, res, s);
   }
   if (s.step === 'name') {
@@ -518,9 +484,38 @@ app.post('/take-message', (req, res) => {
   const s = getSession(req.body.CallSid);
   s.data.type = 'message';
   s.step = 'one-shot';
+  // If the caller has been silent through 3 prompts, stop looping and alert the owner.
+  s.silentLoops = (s.silentLoops || 0) + 1;
+  if (s.silentLoops >= 3) {
+    s.data.details = '(caller stayed on the line but did not leave a message)';
+    return finalize(req, res, s);
+  }
   const r = newCall();
   ask(r, `Please say your name and your message, and we'll call you back.`, '/collect');
   res.type('text/xml').send(r.toString());
+});
+
+// Twilio calls this when a call ends (set as statusCallback on the phone number).
+// Catches callers who hang up mid-flow before finalize() runs.
+app.post('/call-status', async (req, res) => {
+  const callSid = req.body.CallSid;
+  const status = req.body.CallStatus;
+  const s = sessions.get(callSid);
+  if (s && !s.finalized && ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(status)) {
+    s.finalized = true;
+    const caller = req.body.From || 'unknown';
+    const d = s.data || {};
+    const duration = parseInt(req.body.CallDuration || '0', 10);
+    // Only alert if we learned something or they stayed on a while.
+    if (d.name || d.phone || d.issue || d.details || duration > 20) {
+      await writeLog({ from: caller, type: (d.type || 'incomplete') + ' (hung up)', name: d.name || '-', phone: d.phone || caller, details: d.details || '(hung up before leaving details)' });
+      for (const num of CONFIG.ownerPhones) {
+        await sendSms(num, `Missed call — ${d.name || 'unknown'} (${d.phone || caller}) hung up before finishing. ${d.details || 'No details left.'} Call back: ${d.phone || caller}`);
+      }
+    }
+    sessions.delete(callSid);
+  }
+  res.sendStatus(200);
 });
 
 /* ==================== SMS auto-reply ==================== */
