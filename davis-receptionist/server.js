@@ -30,7 +30,7 @@ const CONFIG = {
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || 'https://davis-receptionist.onrender.com').replace(/\/$/, ''),
   voice: 'Polly.Salli-Neural',                // Twilio Polly neural voice (on Twilio's supported list)
   language: 'en-US',
-  hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
+  hours: { start: 8, end: 17 },                // business hours (Mon-Fri) in CONFIG.timeZone; greeting only
   timeZone: process.env.TIME_ZONE || 'America/Chicago',
 };
 
@@ -180,10 +180,14 @@ function getSession(callSid) {
 const newCall = () => new twilio.twiml.VoiceResponse();
 const inHours = () => {
   // Business hours are evaluated in the business's timezone, not the server's (Render runs on UTC).
-  const h = Number(new Intl.DateTimeFormat('en-US', {
-    timeZone: CONFIG.timeZone, hour: 'numeric', hour12: false,
-  }).format(new Date()));
-  return h >= CONFIG.hours.start && h < CONFIG.hours.end;
+  // Monday–Friday, 8 AM–5 PM. Everything else (evenings, weekends) counts as after hours.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: CONFIG.timeZone, hour: 'numeric', hour12: false, weekday: 'short',
+  }).formatToParts(new Date());
+  const h = Number(parts.find((p) => p.type === 'hour').value);
+  const dow = parts.find((p) => p.type === 'weekday').value;
+  const isWeekday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(dow);
+  return isWeekday && h >= CONFIG.hours.start && h < CONFIG.hours.end;
 };
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
