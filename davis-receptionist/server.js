@@ -351,13 +351,13 @@ async function finalizeInner(req, res, s) {
     );
   }
 
-  // Text the caller the booking link for service requests — only with explicit consent.
+  // Text the caller the scheduling link — only with explicit consent (A2P compliance).
   const r = newCall();
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
-  if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
+  if ((d.type === 'service request' || d.type === 'general inquiry') && CONFIG.bookingUrl && d.smsConsent) {
     const link = await makeTrackedLink(caller, CONFIG.bookingUrl);
     await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`);
-    goodbye += ' I also just texted you our online booking link.';
+    goodbye += ' I also just texted you our online scheduling link.';
   }
   r.say({ voice: CONFIG.voice }, goodbye + ' Goodbye.');
   r.hangup();
@@ -439,6 +439,17 @@ app.post('/collect', (req, res) => {
   if (s.step === 'se-phone') {
     const digits = heard.replace(/\D/g, '');
     s.data.phone = /caller|my number|this number/i.test(heard) || digits.length < 7 ? req.body.From : heard;
+    // Ask SMS consent before texting the scheduling link (A2P compliance).
+    s.step = 'se-consent';
+    ask(r, "One last thing — can I text you our online scheduling link? " +
+      'Message frequency varies, message and data rates may apply, and reply STOP to cancel. ' +
+      'By saying yes, you agree to our SMS terms and privacy policy, which are posted on our website. ' +
+      'Just say yes or no.', '/collect');
+    return res.type('text/xml').send(r.toString());
+  }
+  if (s.step === 'se-consent') {
+    const t = heard.toLowerCase();
+    s.data.smsConsent = /\b(yes|yeah|yep|yup|sure|okay|ok|please|go ahead|do it|sounds good|that works|correct|absolutely)\b/.test(t);
     return finalize(req, res, s);
   }
   if (s.step === 'name') {
