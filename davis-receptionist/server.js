@@ -32,6 +32,9 @@ const CONFIG = {
   language: 'en-US',
   hours: { start: 8, end: 17 },                // business hours in CONFIG.timeZone; greeting only
   timeZone: process.env.TIME_ZONE || 'America/Chicago',
+  // Booking-link auto-reply to inbound texts fires only if this number hasn't
+  // texted within the window — avoids spamming it mid-conversation.
+  autoReplyCooldownHours: Number(process.env.AUTO_REPLY_COOLDOWN_HOURS) || 24,
 };
 
 const twilioNumber = process.env.TWILIO_PHONE_NUMBER || '';
@@ -520,13 +523,45 @@ app.post('/call-status', async (req, res) => {
 
 /* ==================== SMS auto-reply ==================== */
 const digits = (s) => String(s || '').replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+
+/* Count prior inbound texts from a number within the given hours (used to
+   suppress the booking-link auto-reply mid-conversation). */
+async function recentSmsInboundCount(from, hours) {
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT COUNT(*)::int AS n FROM calls
+         WHERE type = 'sms inbound' AND from_number = $1 AND at > $2`,
+        [from, new Date(cutoff).toISOString()]
+      );
+      return rows[0].n;
+    } catch (e) {
+      console.error('sms recency check failed:', e.message);
+      return 0; // fail-open: send the auto-reply (current behavior)
+    }
+  }
+  try {
+    return readLogLocal().filter(
+      (l) => l.type === 'sms inbound' && l.from === from && new Date(l.at).getTime() > cutoff
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
 app.post('/sms', async (req, res) => {
   const r = new twilio.twiml.MessagingResponse();
   const from = req.body.From || 'unknown';
   const text = req.body.Body || '-';
-  const link = CONFIG.bookingUrl ? await makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
-  const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
-  r.message(body);
+  // Only auto-reply with the booking link on a fresh conversation — if they've
+  // texted within the cooldown window, just log and alert the owner instead.
+  const priorCount = await recentSmsInboundCount(from, CONFIG.autoReplyCooldownHours);
+  if (priorCount === 0) {
+    const link = CONFIG.bookingUrl ? await makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
+    const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
+    r.message(body);
+  }
   await writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
   // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
