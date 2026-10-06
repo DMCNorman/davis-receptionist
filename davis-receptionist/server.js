@@ -658,10 +658,16 @@ app.post('/sms', async (req, res) => {
   // Photos go through as MMS attachments so the owner sees them in the thread.
   // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
   const ownerDigits = CONFIG.ownerPhones.map(digits);
-  if (!ownerDigits.includes(digits(from))) {
+  const isOwner = ownerDigits.includes(digits(from));
+  if (!isOwner) {
     for (const num of CONFIG.ownerPhones) {
       await sendSms(num, `Text reply from ${from}: ${text}${mediaUrls.length ? ' (photo attached)' : ''}`, mediaUrls);
     }
+  } else if (mediaUrls.length) {
+    // Owner testing MMS from their own phone: echo the photo back so they
+    // can confirm the pipeline works (self-ping guard skips the normal alert).
+    const m = r.message('Photo received and stored:');
+    for (const u of mediaUrls.slice(0, 10)) m.media(u);
   }
   res.type('text/xml').send(r.toString());
 });
