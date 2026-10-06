@@ -211,14 +211,94 @@ function classify(text) {
   return 'other';
 }
 
-async function sendSms(to, body) {
+async function sendSms(to, body, mediaUrls) {
   if (!client || !twilioNumber || !to) return;
   try {
-    await client.messages.create({ to, from: twilioNumber, body });
+    const msg = { to, from: twilioNumber, body };
+    if (Array.isArray(mediaUrls) && mediaUrls.length) msg.mediaUrl = mediaUrls.slice(0, 10);
+    await client.messages.create(msg);
   } catch (e) {
     console.error('SMS failed:', e.message);
   }
 }
+
+/* ==================== Inbound MMS photos ==================== */
+// Incoming picture texts arrive on /sms with NumMedia/MediaUrl{i}. Twilio's
+// media URLs require basic auth, so we download each photo server-side and
+// re-host it at /m/:token for the owner alert + dashboard.
+const MEDIA_DIR = path.join(__dirname, 'data', 'media');
+const MEDIA_MAX_BYTES = 5 * 1024 * 1024; // Twilio MMS cap; skip anything bigger
+
+function twilioAuthHeader() {
+  return 'Basic ' + Buffer.from(
+    `${process.env.TWILIO_ACCOUNT_SID || ''}:${process.env.TWILIO_AUTH_TOKEN || ''}`
+  ).toString('base64');
+}
+
+function downloadUrl(url, maxBytes) {
+  return new Promise((resolve) => {
+    const lib = url.startsWith('https') ? require('https') : require('http');
+    const req = lib.get(url, { headers: { Authorization: twilioAuthHeader() } }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > maxBytes) { req.destroy(); return resolve(null); }
+        chunks.push(c);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+  });
+}
+
+/** Download inbound MMS attachments, store them, return public URLs. */
+async function storeInboundMedia(body, from) {
+  const n = Math.min(parseInt(body.NumMedia || '0', 10) || 0, 10);
+  const urls = [];
+  for (let i = 0; i < n; i++) {
+    const mediaUrl = body[`MediaUrl${i}`];
+    if (!mediaUrl) continue;
+    const contentType = body[`MediaContentType${i}`] || 'application/octet-stream';
+    const token = crypto.randomBytes(9).toString('hex');
+    try {
+      const data = await downloadUrl(mediaUrl, MEDIA_MAX_BYTES);
+      if (!data) continue;
+      fs.mkdirSync(MEDIA_DIR, { recursive: true });
+      fs.writeFileSync(path.join(MEDIA_DIR, token), data);
+      fs.writeFileSync(path.join(MEDIA_DIR, `${token}.json`),
+        JSON.stringify({ contentType, from, at: new Date().toISOString() }));
+      // Prune oldest files past the cap so the media dir can't grow forever.
+      try {
+        const files = fs.readdirSync(MEDIA_DIR).filter((f) => !f.endsWith('.json'))
+          .map((f) => ({ f, m: fs.statSync(path.join(MEDIA_DIR, f)).mtimeMs }))
+          .sort((a, b) => b.m - a.m);
+        for (const old of files.slice(200)) {
+          try { fs.unlinkSync(path.join(MEDIA_DIR, old.f)); fs.unlinkSync(path.join(MEDIA_DIR, `${old.f}.json`)); } catch {}
+        }
+      } catch {}
+      urls.push({ url: `${CONFIG.publicBaseUrl}/m/${token}`, contentType });
+    } catch (e) {
+      console.error('media store failed:', e.message);
+    }
+  }
+  return urls;
+}
+
+/** Serve a stored inbound photo. */
+app.get('/m/:token', (req, res) => {
+  const token = String(req.params.token || '').replace(/[^a-f0-9]/g, '');
+  if (!token) return res.status(404).send('Not found.');
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${token}.json`), 'utf8'));
+    const data = fs.readFileSync(path.join(MEDIA_DIR, token));
+    res.type(meta.contentType || 'application/octet-stream').send(data);
+  } catch {
+    res.status(404).send('This photo is no longer available.');
+  }
+});
 
 /* ==================== Self-hosted tracked booking links ==================== */
 // Each booking-link text gets a unique /b/:token URL. Tapping it logs the tap
@@ -554,21 +634,33 @@ app.post('/sms', async (req, res) => {
   const r = new twilio.twiml.MessagingResponse();
   const from = req.body.From || 'unknown';
   const text = req.body.Body || '-';
+  // Inbound photos: download, re-host, and include them in the owner alert.
+  const media = await storeInboundMedia(req.body, from);
+  const mediaUrls = media.map((m) => m.url);
+  const photoNote = mediaUrls.length
+    ? ` [${mediaUrls.length} photo${mediaUrls.length > 1 ? 's' : ''}: ${mediaUrls.join(', ')}]`
+    : '';
   // Only auto-reply with the booking link on a fresh conversation — if they've
   // texted within the cooldown window, just log and alert the owner instead.
   const priorCount = await recentSmsInboundCount(from, CONFIG.autoReplyCooldownHours);
   if (priorCount === 0) {
     const link = CONFIG.bookingUrl ? await makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
-    const body = `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
+    const body = mediaUrls.length
+      ? `Got the photo, thanks! We'll take a look. Book online here: ${link} — or just reply and we'll call you back.`
+      : `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
     r.message(body);
+  } else if (mediaUrls.length) {
+    // Mid-conversation photo: acknowledge it without re-sending the booking link.
+    r.message('Got the photo, thanks — we\'ll take a look and get back to you.');
   }
-  await writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text });
+  await writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text + photoNote });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
+  // Photos go through as MMS attachments so the owner sees them in the thread.
   // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
   const ownerDigits = CONFIG.ownerPhones.map(digits);
   if (!ownerDigits.includes(digits(from))) {
     for (const num of CONFIG.ownerPhones) {
-      await sendSms(num, `Text reply from ${from}: ${text}`);
+      await sendSms(num, `Text reply from ${from}: ${text}${mediaUrls.length ? ' (photo attached)' : ''}`, mediaUrls);
     }
   }
   res.type('text/xml').send(r.toString());
@@ -652,7 +744,8 @@ app.get('/privacy-policy', (req, res) => {
 <h2>Information we collect</h2>
 <p>When you call Davis Mechanical Contractors at <strong>713-875-0980</strong>, our automated
 receptionist may collect your name, phone number, service address, and a description of the
-HVAC issue you are calling about. We also retain call timestamps and call logs for service
+HVAC issue you are calling about, and any photos you choose to text to our number
+(e.g. pictures of your equipment). We also retain call timestamps and call logs for service
 and compliance purposes.</p>
 
 <h2>How we use your information</h2>
