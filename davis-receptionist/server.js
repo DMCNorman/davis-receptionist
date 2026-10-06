@@ -235,10 +235,17 @@ function twilioAuthHeader() {
   ).toString('base64');
 }
 
-function downloadUrl(url, maxBytes) {
+function downloadUrl(url, maxBytes, hops = 0) {
   return new Promise((resolve) => {
+    if (hops > 5) return resolve(null);
     const lib = url.startsWith('https') ? require('https') : require('http');
     const req = lib.get(url, { headers: { Authorization: twilioAuthHeader() } }, (res) => {
+      // Twilio media URLs 307-redirect to mms.twiliocdn.com — follow them.
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return resolve(downloadUrl(next, maxBytes, hops + 1));
+      }
       if (res.statusCode !== 200) { res.resume(); return resolve(null); }
       const chunks = [];
       let size = 0;
