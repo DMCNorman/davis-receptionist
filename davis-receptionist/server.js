@@ -460,8 +460,8 @@ async function finalizeInner(req, res, s) {
 app.post('/voice', (req, res) => {
   const r = newCall();
   const intro = inHours()
-    ? `Thanks for calling ${CONFIG.businessName}.`
-    : `Thanks for calling ${CONFIG.businessName}. You've reached us after hours, but I can still help you.`;
+    ? `Thank you for contacting ${CONFIG.businessName}.`
+    : `Thank you for contacting ${CONFIG.businessName}. You've reached us after hours, but I can still help you.`;
   ask(r, `${intro} Are you calling about a new service request, an existing appointment, or something else?`, '/route');
   res.type('text/xml').send(r.toString());
 });
