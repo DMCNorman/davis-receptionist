@@ -616,13 +616,11 @@ app.post('/call-status', async (req, res) => {
     s.finalized = true;
     const caller = req.body.From || 'unknown';
     const d = s.data || {};
-    const duration = parseInt(req.body.CallDuration || '0', 10);
-    // Only alert if we learned something or they stayed on a while.
-    if (d.name || d.phone || d.issue || d.details || duration > 20) {
-      await writeLog({ from: caller, type: (d.type || 'incomplete') + ' (hung up)', name: d.name || '-', phone: d.phone || caller, details: d.details || '(hung up before leaving details)' });
-      for (const num of CONFIG.ownerPhones) {
-        await sendSms(num, `Missed call — ${d.name || 'unknown'} (${d.phone || caller}) hung up before finishing. ${d.details || 'No details left.'} Call back: ${d.phone || caller}`);
-      }
+    // Alert on EVERY hangup, no matter how short (Norman's call, 2026-10-15 —
+    // he wants to know about every caller who bails, even instant ones).
+    await writeLog({ from: caller, type: (d.type || 'incomplete') + ' (hung up)', name: d.name || '-', phone: d.phone || caller, details: d.details || '(hung up before leaving details)' });
+    for (const num of CONFIG.ownerPhones) {
+      await sendSms(num, `Missed call — ${d.name || 'unknown'} (${d.phone || caller}) hung up before finishing. ${d.details || 'No details left.'} Call back: ${d.phone || caller}`);
     }
     sessions.delete(callSid);
   }
