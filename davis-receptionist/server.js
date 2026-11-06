@@ -275,6 +275,21 @@ async function sendSms(to, body, mediaUrls) {
   }
 }
 
+/* Upgrade #2 (added 2026-11-06 at Norman's request; he picked per-text over a
+   daily summary): every text the system sends a CUSTOMER is copied to the
+   owner phone(s) immediately, as it sends, so Norman sees exactly what went
+   out. Owner-bound alerts are not copied (owners already receive them), and
+   nothing is copied when the "customer" is an owner number (test calls). */
+async function copyTextToOwners(to, body) {
+  const ownerDigits = CONFIG.ownerPhones.map(digits);
+  if (!ownerDigits.length || ownerDigits.includes(digits(to))) return;
+  const name = lookupCallerName(to);
+  const label = name ? `${name} (${to})` : to;
+  for (const num of CONFIG.ownerPhones) {
+    await sendSms(num, `Text sent to ${label}: ${body}`);
+  }
+}
+
 /* ==================== Inbound MMS photos ==================== */
 // Incoming picture texts arrive on /sms with NumMedia/MediaUrl{i}. Twilio's
 // media URLs require basic auth, so we download each photo server-side and
@@ -501,7 +516,9 @@ async function finalizeInner(req, res, s) {
   let goodbye = `Thanks ${d.name || 'for calling'}. I've passed your information along and someone will call you back.`;
   if (d.type === 'service request' && CONFIG.bookingUrl && d.smsConsent) {
     const link = await makeTrackedLink(caller, CONFIG.bookingUrl);
-    await sendSms(caller, `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`);
+    const bookingText = `Thanks for calling ${CONFIG.businessName}! Book your visit here: ${link}`;
+    await sendSms(caller, bookingText);
+    await copyTextToOwners(caller, bookingText);
     goodbye += ' I also just texted you our online booking link.';
   }
   r.say({ voice: CONFIG.voice }, goodbye + ' Goodbye.');
@@ -724,15 +741,18 @@ app.post('/sms', async (req, res) => {
   // Only auto-reply with the booking link on a fresh conversation — if they've
   // texted within the cooldown window, just log and alert the owner instead.
   const priorCount = await recentSmsInboundCount(from, CONFIG.autoReplyCooldownHours);
+  let replyBody = null; // set when we auto-reply to the customer (upgrade #2 copy)
   if (priorCount === 0) {
     const link = CONFIG.bookingUrl ? await makeTrackedLink(from, CONFIG.bookingUrl) : '(booking link coming soon)';
     const body = mediaUrls.length
       ? `Got the photo, thanks! We'll take a look. Book online here: ${link} — or just reply and we'll call you back.`
       : `Thanks for texting ${CONFIG.businessName}! Book online here: ${link} — or just reply and we'll call you back.`;
     r.message(body);
+    replyBody = body;
   } else if (mediaUrls.length) {
     // Mid-conversation photo: acknowledge it without re-sending the booking link.
-    r.message('Got the photo, thanks — we\'ll take a look and get back to you.');
+    replyBody = 'Got the photo, thanks — we\'ll take a look and get back to you.';
+    r.message(replyBody);
   }
   await writeLog({ from, type: 'sms inbound', name: lookupCallerName(from) || '-', phone: from, details: text + photoNote });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
@@ -752,6 +772,8 @@ app.post('/sms', async (req, res) => {
     const m = r.message('Photo received and stored:');
     for (const u of mediaUrls.slice(0, 10)) m.media(u);
   }
+  // Upgrade #2: if we auto-replied to a customer, copy that reply to the owners.
+  if (replyBody && !isOwner) await copyTextToOwners(from, replyBody);
   res.type('text/xml').send(r.toString());
 });
 
