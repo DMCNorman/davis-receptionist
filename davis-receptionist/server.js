@@ -47,7 +47,7 @@ const client = hasTwilio ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TW
    purpose — customer numbers are never committed to the repo. When a known
    number calls or texts, owner alerts and the call log show the name
    instead of 'unknown'. Added 2026-11-05 at Norman's request (upgrade #1). */
-const KNOWN_CALLERS = (() => {
+const ENV_CALLERS = (() => {
   try {
     const raw = JSON.parse(process.env.KNOWN_CALLERS || '{}');
     const map = new Map();
@@ -62,6 +62,25 @@ const KNOWN_CALLERS = (() => {
   }
 })();
 
+/* The live map starts as the curated env entries; once Postgres is up,
+   refreshKnownCallers() merges in the known_callers table (bulk contacts —
+   too many for an env var). Curated env entries always win on conflict. */
+let KNOWN_CALLERS = new Map(ENV_CALLERS);
+
+async function refreshKnownCallers() {
+  if (!pgPool) return;
+  try {
+    const { rows } = await pgPool.query('SELECT phone, name FROM known_callers');
+    const merged = new Map();
+    for (const r of rows) merged.set(r.phone, r.name);
+    for (const [k, v] of ENV_CALLERS) merged.set(k, v);
+    KNOWN_CALLERS = merged;
+    console.log(`known-callers: ${KNOWN_CALLERS.size} numbers loaded (${rows.length} from db, ${ENV_CALLERS.size} curated)`);
+  } catch (e) {
+    console.error('known-callers db load failed:', e.message);
+  }
+}
+
 function lookupCallerName(phone) {
   const d = String(phone || '').replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
   return KNOWN_CALLERS.get(d) || null;
@@ -71,6 +90,7 @@ console.log(`known-callers: ${KNOWN_CALLERS.size} numbers loaded`);
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: '2mb' })); // for the /admin/known-callers loader only
 
 /* ==================== Call log + tracked links (Postgres when DATABASE_URL
      is set — survives deploys/restarts; JSON file fallback otherwise) ==================== */
@@ -101,8 +121,13 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       hits INT DEFAULT 0, last_hit_at TIMESTAMPTZ, tapped_at TIMESTAMPTZ
     )`);
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS known_callers (
+      phone TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    )`);
     console.log('storage: Postgres connected (durable log)');
     await migrateLocalFilesOnce();
+    await refreshKnownCallers();
   } catch (e) {
     console.error('storage: Postgres init failed, falling back to local files:', e.message);
     pgPool = null;
@@ -788,7 +813,46 @@ h1{font-size:22px} .meta{color:#666;margin-bottom:16px}</style></head>
 </body></html>`);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, twilio: hasTwilio, linkTracking: 'self-hosted' }));
+app.get('/health', (req, res) => res.json({ ok: true, twilio: hasTwilio, linkTracking: 'self-hosted', knownCallers: KNOWN_CALLERS.size }));
+
+/* Bulk-load the known_callers table (Norman's phone contacts export — far too
+   many for an env var). Guarded by the ADMIN_SECRET env var, sent as the
+   x-admin-secret header. Body: JSON object { "8325551212": "Name", ... }.
+   Pass ?replace=1 to wipe the table first so it mirrors the upload exactly. */
+app.post('/admin/known-callers', async (req, res) => {
+  const secret = process.env.ADMIN_SECRET || '';
+  if (!secret || req.get('x-admin-secret') !== secret) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  if (!pgPool) return res.status(503).json({ ok: false, error: 'no database connected' });
+  const entries = Object.entries(req.body || {});
+  if (!entries.length) return res.status(400).json({ ok: false, error: 'empty body' });
+  const dbClient = await pgPool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    if (req.query.replace === '1') await dbClient.query('DELETE FROM known_callers');
+    let n = 0;
+    for (const [num, name] of entries) {
+      const d = String(num).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+      if (d.length === 10 && name) {
+        await dbClient.query(
+          `INSERT INTO known_callers (phone, name) VALUES ($1, $2)
+           ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name`,
+          [d, String(name)]
+        );
+        n++;
+      }
+    }
+    await dbClient.query('COMMIT');
+    await refreshKnownCallers();
+    res.json({ ok: true, upserted: n, total: KNOWN_CALLERS.size });
+  } catch (e) {
+    await dbClient.query('ROLLBACK');
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    dbClient.release();
+  }
+});
 
 /* ==================== Public compliance pages (A2P registration) ==================== */
 const PAGE_STYLE = `body{font-family:system-ui,-apple-system,sans-serif;margin:0;color:#222;line-height:1.6}
