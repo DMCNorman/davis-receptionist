@@ -41,6 +41,34 @@ const twilioNumber = process.env.TWILIO_PHONE_NUMBER || '';
 const hasTwilio = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN);
 const client = hasTwilio ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
+/* ==================== Known-caller name lookup ====================
+   KNOWN_CALLERS env var: JSON object mapping 10-digit numbers to names
+   (ESA customers + callers Norman has identified). Kept in an env var on
+   purpose — customer numbers are never committed to the repo. When a known
+   number calls or texts, owner alerts and the call log show the name
+   instead of 'unknown'. Added 2026-11-05 at Norman's request (upgrade #1). */
+const KNOWN_CALLERS = (() => {
+  try {
+    const raw = JSON.parse(process.env.KNOWN_CALLERS || '{}');
+    const map = new Map();
+    for (const [num, name] of Object.entries(raw)) {
+      const d = String(num).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+      if (d.length === 10 && name) map.set(d, String(name));
+    }
+    return map;
+  } catch (e) {
+    console.error('KNOWN_CALLERS env var is not valid JSON — name lookup disabled:', e.message);
+    return new Map();
+  }
+})();
+
+function lookupCallerName(phone) {
+  const d = String(phone || '').replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+  return KNOWN_CALLERS.get(d) || null;
+}
+
+console.log(`known-callers: ${KNOWN_CALLERS.size} numbers loaded`);
+
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
@@ -432,13 +460,14 @@ async function finalizeInner(req, res, s) {
   const caller = req.body.From || 'unknown';
   s.finalized = true; // Prevent double-alert from /call-status
 
-  await writeLog({ from: caller, type: d.type, name: d.name || '-', phone: d.phone || caller, details: d.details || '-' });
+  const displayName = lookupCallerName(caller) || d.name || 'unknown';
+  await writeLog({ from: caller, type: d.type, name: d.name || lookupCallerName(caller) || '-', phone: d.phone || caller, details: d.details || '-' });
 
   // Alert the owner(s) — supports multiple comma-separated numbers
   for (const num of CONFIG.ownerPhones) {
     await sendSms(
       num,
-      `New ${d.type} — ${d.name || 'unknown'} (${d.phone || caller}): ${d.details || 'no details'}`
+      `New ${d.type} — ${displayName} (${d.phone || caller}): ${d.details || 'no details'}`
     );
   }
 
@@ -618,9 +647,10 @@ app.post('/call-status', async (req, res) => {
     const d = s.data || {};
     // Alert on EVERY hangup, no matter how short (Norman's call, 2026-10-15 —
     // he wants to know about every caller who bails, even instant ones).
-    await writeLog({ from: caller, type: (d.type || 'incomplete') + ' (hung up)', name: d.name || '-', phone: d.phone || caller, details: d.details || '(hung up before leaving details)' });
+    const displayName = lookupCallerName(caller) || d.name || 'unknown';
+    await writeLog({ from: caller, type: (d.type || 'incomplete') + ' (hung up)', name: d.name || lookupCallerName(caller) || '-', phone: d.phone || caller, details: d.details || '(hung up before leaving details)' });
     for (const num of CONFIG.ownerPhones) {
-      await sendSms(num, `Missed call — ${d.name || 'unknown'} (${d.phone || caller}) hung up before finishing. ${d.details || 'No details left.'} Call back: ${d.phone || caller}`);
+      await sendSms(num, `Missed call — ${displayName} (${d.phone || caller}) hung up before finishing. ${d.details || 'No details left.'} Call back: ${d.phone || caller}`);
     }
     sessions.delete(callSid);
   }
@@ -679,15 +709,17 @@ app.post('/sms', async (req, res) => {
     // Mid-conversation photo: acknowledge it without re-sending the booking link.
     r.message('Got the photo, thanks — we\'ll take a look and get back to you.');
   }
-  await writeLog({ from, type: 'sms inbound', name: '-', phone: from, details: text + photoNote });
+  await writeLog({ from, type: 'sms inbound', name: lookupCallerName(from) || '-', phone: from, details: text + photoNote });
   // Alert the owner(s) so text replies don't sit unseen on the dashboard.
   // Photos go through as MMS attachments so the owner sees them in the thread.
   // Skip when the reply came from one of the owner's own numbers (avoid self-pings).
   const ownerDigits = CONFIG.ownerPhones.map(digits);
   const isOwner = ownerDigits.includes(digits(from));
   if (!isOwner) {
+    const knownName = lookupCallerName(from);
+    const fromLabel = knownName ? `${knownName} (${from})` : from;
     for (const num of CONFIG.ownerPhones) {
-      await sendSms(num, `Text reply from ${from}: ${text}${mediaUrls.length ? ' (photo attached)' : ''}`, mediaUrls);
+      await sendSms(num, `Text reply from ${fromLabel}: ${text}${mediaUrls.length ? ' (photo attached)' : ''}`, mediaUrls);
     }
   } else if (mediaUrls.length) {
     // Owner testing MMS from their own phone: echo the photo back so they
